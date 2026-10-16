@@ -30,8 +30,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 log = logging.getLogger("vtb-telegram-bot")
 
 state = {
-    "bid": None, "offer": None, "tracked_rate": None,
-    "last_hour": None, "target_triggered": False, "last_updated": None
+    "bid": None,
+    "offer": None,
+    "tracked_rate": None,
+    "previous_tracked": None,
+    "change_delta": None,
+    "change_arrow": "🔄",
+    "last_hour": None,
+    "target_triggered": False,
+    "last_updated": None,
 }
 
 def load_state():
@@ -62,15 +69,28 @@ def fmt(value):
         return "—"
     return f"{Decimal(str(value)):.4f}"
 
-def rates_message(title="Курс юаня ВТБ"):
+def rates_message():
+    """Формат /status: последнее изменение отслеживаемого курса."""
     rate = tracked_rate()
+    previous = state.get("previous_tracked")
+    delta = state.get("change_delta")
+    arrow = state.get("change_arrow") or "🔄"
+
     return (
-        f"{title}, сумма до 500 000 ₽\n\n"
-        f"Покупка ВТБ (bid): {fmt(state.get('bid'))} ₽\n"
-        f"Продажа ВТБ (offer): {fmt(state.get('offer'))} ₽\n"
+        f"{arrow} Изменение курса юаня ВТБ\n\n"
+        f"Покупка: {fmt(state.get('bid'))} ₽\n"
+        f"Продажа: {fmt(state.get('offer'))} ₽\n"
         f"Отслеживаемый курс ({RATE_TYPE}): {fmt(rate)} ₽\n"
-        f"Обновлено: {state.get('last_updated') or 'ещё не получено'}"
+        f"Предыдущий: {fmt(previous)} ₽\n"
+        f"Изменение: {'—' if delta is None else fmt_signed(delta)} ₽\n"
+        f"Время: {state.get('last_updated') or 'ещё не получено'}"
     )
+
+
+def fmt_signed(value):
+    if value is None:
+        return "—"
+    return f"{Decimal(str(value)):+.4f}"
 
 async def send_to_chat(app, message):
     if CHAT_ID:
@@ -144,11 +164,26 @@ async def receive_rates(request: web.Request):
     first = previous_bid is None or previous_offer is None
     changed = first or bid != previous_bid or offer != previous_offer
 
+    current_tracked = bid if RATE_TYPE == "bid" else offer
+    if previous_tracked is None:
+        state["previous_tracked"] = None
+        state["change_delta"] = None
+        state["change_arrow"] = "🔄"
+    else:
+        delta_value = current_tracked - previous_tracked
+        state["previous_tracked"] = str(previous_tracked)
+        state["change_delta"] = str(delta_value)
+        if delta_value > 0:
+            state["change_arrow"] = "📈"
+        elif delta_value < 0:
+            state["change_arrow"] = "📉"
+        else:
+            state["change_arrow"] = "🔄"
+
     state["bid"] = str(bid)
     state["offer"] = str(offer)
-    state["tracked_rate"] = str(bid if RATE_TYPE == "bid" else offer)
+    state["tracked_rate"] = str(current_tracked)
     state["last_updated"] = updated_at
-    current_tracked = tracked_rate()
 
     app = request.app["telegram_app"]
     try:
@@ -166,16 +201,7 @@ async def receive_rates(request: web.Request):
                 else f"{current_tracked - previous_tracked:+.4f}"
             )
 
-            message = (
-                f"{arrow} Изменение курса юаня ВТБ\n\n"
-                f"Покупка: {fmt(bid)} ₽\n"
-                f"Продажа: {fmt(offer)} ₽\n"
-                f"Отслеживаемый курс ({RATE_TYPE}): {fmt(current_tracked)} ₽\n"
-                f"Предыдущий: {fmt(previous_tracked)} ₽\n"
-                f"Изменение: {delta} ₽\n"
-                f"Время: {updated_at}"
-            )
-            await send_to_chat(app, message)
+            await send_to_chat(app, rates_message())
 
         if TARGET_RATE > 0:
             reached = current_tracked >= TARGET_RATE if TARGET_DIRECTION == "above" else current_tracked <= TARGET_RATE
