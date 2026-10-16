@@ -1,330 +1,421 @@
 import os
 import json
+import asyncio
 import logging
-import hmac
 from pathlib import Path
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
+import requests
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
-from aiohttp import web
+
+# =========================================================
+# НАСТРОЙКИ
+# =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env", override=True)
+load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
-SHARED_SECRET = os.getenv("SHARED_SECRET", "").strip()
-RATE_TYPE = os.getenv("RATE_TYPE", "offer").strip().lower()
-TARGET_RATE = Decimal(os.getenv("TARGET_RATE", "0").replace(",", "."))
-TARGET_DIRECTION = os.getenv("TARGET_DIRECTION", "below").strip().lower()
-PORT = int(os.getenv("PORT", "8080"))
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram-webhook").strip()
-TIMEZONE_LABEL = os.getenv("TIMEZONE_LABEL", "local time")
 
-STATE_FILE = BASE_DIR / "state.json"
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("vtb-telegram-bot")
+# URL API ноды BotHost, которая получает курс
+RATES_API_URL = os.getenv("RATES_API_URL", "").strip()
+
+# Один и тот же секрет должен быть настроен на обеих сторонах
+SHARED_SECRET = os.getenv("SHARED_SECRET", "").strip()
+
+RATE_TYPE = os.getenv("RATE_TYPE", "offer").strip().lower()
+TARGET_RATE = Decimal(
+    os.getenv("TARGET_RATE", "0").replace(",", ".")
+)
+TARGET_DIRECTION = os.getenv("TARGET_DIRECTION", "below").strip().lower()
+
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
+MAX_AMOUNT = Decimal("500000.00")
+
+STATE_FILE = Path(
+    os.getenv("DATA_DIR", str(BASE_DIR))
+) / "state.json"
+
+STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+)
+log = logging.getLogger(__name__)
+
+session = requests.Session()
+session.headers.update({"Accept": "application/json"})
+
+if SHARED_SECRET:
+    session.headers.update({"X-Shared-Secret": SHARED_SECRET})
 
 state = {
+    "rate": None,
     "bid": None,
     "offer": None,
-    "tracked_rate": None,
-    "previous_tracked": None,
-    "change_delta": None,
-    "change_arrow": "🔄",
     "last_hour": None,
-    "target_triggered": False,
     "last_updated": None,
+    "previous_rate": None,
+    "last_delta": None,
+    "last_arrow": None,
+    "target_triggered": False,
 }
 
+
+# =========================================================
+# СОХРАНЕНИЕ СОСТОЯНИЯ
+# =========================================================
+
 def load_state():
-    global state
+    if not STATE_FILE.exists():
+        return
+
     try:
-        if STATE_FILE.exists():
-            saved = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(saved, dict):
-                state.update(saved)
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+
+        if isinstance(saved, dict):
+            state.update(saved)
+
     except Exception:
         log.exception("Не удалось загрузить state.json")
 
+
 def save_state():
+    temp_file = STATE_FILE.with_suffix(".tmp")
+
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+    temp_file.replace(STATE_FILE)
+
+
+# =========================================================
+# ПОЛУЧЕНИЕ КУРСА ИЗ НОДЫ BOTHOST
+# =========================================================
+
+def get_yuan_rates():
+    if not RATES_API_URL:
+        raise RuntimeError(
+            "Не задан RATES_API_URL — укажи адрес API ноды BotHost"
+        )
+
+    response = session.get(RATES_API_URL, timeout=(10, 20))
+    response.raise_for_status()
+    data = response.json()
+
+    # Поддерживаем как простой JSON, так и объект {"rates": {...}}
+    rates = data.get("rates", data)
+
     try:
-        temp = STATE_FILE.with_suffix(".tmp")
-        temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(STATE_FILE)
-    except Exception:
-        log.exception("Не удалось сохранить state.json")
+        bid = Decimal(str(rates["bid"]))
+        offer = Decimal(str(rates["offer"]))
+    except (KeyError, TypeError, InvalidOperation) as exc:
+        raise ValueError(
+            f"API ноды вернул неожиданный формат: {data}"
+        ) from exc
 
-def tracked_rate():
-    key = "bid" if RATE_TYPE == "bid" else "offer"
-    value = state.get(key)
-    return None if value is None else Decimal(str(value))
+    if (
+        not bid.is_finite()
+        or not offer.is_finite()
+        or bid <= 0
+        or offer <= 0
+    ):
+        raise ValueError("API ноды вернул некорректный курс")
 
-def fmt(value):
-    if value is None:
-        return "—"
-    return f"{Decimal(str(value)):.4f}"
-
-def rates_message():
-    """Формат /status: последнее изменение отслеживаемого курса."""
-    rate = tracked_rate()
-    previous = state.get("previous_tracked")
-    delta = state.get("change_delta")
-    arrow = state.get("change_arrow") or "🔄"
-
-    return (
-        f"{arrow} Изменение курса юаня ВТБ\n\n"
-        f"Покупка: {fmt(state.get('bid'))} ₽\n"
-        f"Продажа: {fmt(state.get('offer'))} ₽\n"
-        f"Отслеживаемый курс ({RATE_TYPE}): {fmt(rate)} ₽\n"
-        f"Предыдущий: {fmt(previous)} ₽\n"
-        f"Изменение: {'—' if delta is None else fmt_signed(delta)} ₽\n"
-        f"Время: {state.get('last_updated') or 'ещё не получено'}"
-    )
+    return {"bid": bid, "offer": offer}
 
 
-def fmt_signed(value):
-    if value is None:
-        return "—"
-    return f"{Decimal(str(value)):+.4f}"
+def get_tracked_rate(rates):
+    return rates["bid"] if RATE_TYPE == "bid" else rates["offer"]
 
-async def send_to_chat(app, message):
-    if CHAT_ID:
-        await app.bot.send_message(chat_id=CHAT_ID, text=message)
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+async def send_message(app, message):
+    await app.bot.send_message(chat_id=CHAT_ID, text=message)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "Бот мониторинга курса юаня ВТБ.\n\n"
+        "Бот мониторинга курса юаня.\n\n"
         f"ID этого чата: {update.effective_chat.id}\n"
         f"Отслеживаемый курс: {RATE_TYPE.upper()}\n"
         "Тариф: до 500 000 ₽\n\n"
-        "/status — последний полученный курс\n"
-        "/target 11.50 — задать целевой курс\n"
-        "/target 0 — отключить порог\n"
+        "/status — последний курс и изменение\n"
+        "/target 12.50 — задать целевой курс\n"
+        "/target 0 — отключить целевой курс\n"
         "/help — помощь"
     )
 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "Команды:\n/start — информация о боте\n/status — последний курс от российского сервера\n"
-        "/target 11.50 — задать порог\n/target 0 — отключить порог\n\n"
-        "Курс приходит от российского сервера, напрямую ВТБ этот бот не опрашивает."
+        "Команды:\n"
+        "/start — информация о боте\n"
+        "/status — последний полученный курс\n"
+        "/target 12.50 — уведомлять при достижении порога\n"
+        "/target 0 — отключить порог\n\n"
+        f"Интервал проверки: {CHECK_INTERVAL} секунд."
     )
 
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if state.get("bid") is None or state.get("offer") is None:
+    if state.get("rate") is None:
         await update.effective_message.reply_text(
-            "Курс ещё не получен от российского сервера. Проверьте, запущен ли poller.py."
+            "Курс пока не получен. Дождись первого успешного ответа ноды."
         )
+        return
+
+    bid = Decimal(str(state["bid"]))
+    offer = Decimal(str(state["offer"]))
+    rate = Decimal(str(state["rate"]))
+
+    previous = state.get("previous_rate")
+    delta = state.get("last_delta")
+    arrow = state.get("last_arrow") or "🔄"
+    updated_at = state.get("last_updated") or "неизвестно"
+
+    if previous is None or delta is None:
+        previous_text = "—"
+        delta_text = "—"
+        heading = "ℹ️ Текущий курс"
     else:
-        await update.effective_message.reply_text(rates_message())
+        previous_text = f"{Decimal(str(previous)):.4f} ₽"
+        delta_text = f"{Decimal(str(delta)):+.4f} ₽"
+        heading = f"{arrow} Последнее изменение курса"
+
+    await update.effective_message.reply_text(
+        f"{heading}\n\n"
+        f"Покупка: {bid:.4f} ₽\n"
+        f"Продажа: {offer:.4f} ₽\n"
+        f"Отслеживаемый курс ({RATE_TYPE}): {rate:.4f} ₽\n"
+        f"Предыдущий: {previous_text}\n"
+        f"Изменение: {delta_text}\n"
+        f"Время: {updated_at}"
+    )
+
 
 async def target_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global TARGET_RATE
+
     if not context.args:
         await update.effective_message.reply_text(
             f"Текущий целевой курс: {TARGET_RATE} ₽\n"
-            f"Направление: {TARGET_DIRECTION}\nПример: /target 11.50"
+            f"Направление: {TARGET_DIRECTION}\n"
+            "Пример: /target 12.50"
         )
         return
+
     try:
         value = Decimal(context.args[0].replace(",", "."))
+
         if not value.is_finite() or value < 0:
             raise ValueError
+
         TARGET_RATE = value
         state["target_triggered"] = False
         save_state()
+
         await update.effective_message.reply_text(
-            "Целевой курс отключён." if value == 0 else f"Целевой курс установлен: {value} ₽"
+            f"Целевой курс установлен: {TARGET_RATE} ₽"
         )
+
     except (InvalidOperation, ValueError):
-        await update.effective_message.reply_text("Укажите неотрицательное число, например /target 11.50")
+        await update.effective_message.reply_text(
+            "Укажи корректное число, например /target 12.50"
+        )
 
-async def receive_rates(request: web.Request):
-    supplied = request.headers.get("X-Shared-Secret", "")
-    if not SHARED_SECRET or not hmac.compare_digest(supplied, SHARED_SECRET):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-    try:
-        body = await request.json()
-        bid = Decimal(str(body["bid"]))
-        offer = Decimal(str(body["offer"]))
-        updated_at = str(body.get("updated_at") or datetime.now().astimezone().strftime("%d.%m.%Y %H:%M:%S"))
-        if not bid.is_finite() or not offer.is_finite() or bid <= 0 or offer <= 0:
-            raise ValueError("bid/offer must be positive")
-    except Exception as exc:
-        return web.json_response({"ok": False, "error": f"invalid payload: {exc}"}, status=400)
 
-    previous_bid = None if state["bid"] is None else Decimal(str(state["bid"]))
-    previous_offer = None if state["offer"] is None else Decimal(str(state["offer"]))
-    previous_tracked = tracked_rate()
-    first = previous_bid is None or previous_offer is None
-    changed = first or bid != previous_bid or offer != previous_offer
+# =========================================================
+# МОНИТОРИНГ
+# =========================================================
 
-    current_tracked = bid if RATE_TYPE == "bid" else offer
-    if previous_tracked is None:
-        state["previous_tracked"] = None
-        state["change_delta"] = None
-        state["change_arrow"] = "🔄"
-    else:
-        delta_value = current_tracked - previous_tracked
-        state["previous_tracked"] = str(previous_tracked)
-        state["change_delta"] = str(delta_value)
-        if delta_value > 0:
-            state["change_arrow"] = "📈"
-        elif delta_value < 0:
-            state["change_arrow"] = "📉"
-        else:
-            state["change_arrow"] = "🔄"
+async def monitor(app):
+    load_state()
 
-    state["bid"] = str(bid)
-    state["offer"] = str(offer)
-    state["tracked_rate"] = str(current_tracked)
-    state["last_updated"] = updated_at
+    while True:
+        try:
+            rates = await asyncio.to_thread(get_yuan_rates)
+            rate = get_tracked_rate(rates)
+            now = datetime.now().astimezone()
+            timestamp = now.strftime("%d.%m.%Y %H:%M:%S")
 
-    app = request.app["telegram_app"]
-    try:
-        if first:
-            await send_to_chat(app, "🟢 Мониторинг курса ВТБ запущен\n\n" + rates_message())
-        elif changed:
-            arrow = "🔄"
-            if previous_tracked is not None and current_tracked > previous_tracked:
-                arrow = "📈"
-            elif previous_tracked is not None and current_tracked < previous_tracked:
-                arrow = "📉"
-            delta = (
-                "—"
-                if previous_tracked is None
-                else f"{current_tracked - previous_tracked:+.4f}"
-            )
+            previous = state.get("rate")
+            previous_bid = state.get("bid")
+            previous_offer = state.get("offer")
 
-            await send_to_chat(app, rates_message())
+            if previous is None:
+                state["rate"] = str(rate)
+                state["bid"] = str(rates["bid"])
+                state["offer"] = str(rates["offer"])
+                state["last_updated"] = timestamp
+                save_state()
 
-        if TARGET_RATE > 0:
-            reached = current_tracked >= TARGET_RATE if TARGET_DIRECTION == "above" else current_tracked <= TARGET_RATE
-            if reached and not state.get("target_triggered", False):
-                await send_to_chat(
+                await send_message(
                     app,
-                    "🚨 ДОСТИГНУТ ЦЕЛЕВОЙ КУРС!\n\n"
-                    f"Текущий курс: {fmt(current_tracked)} ₽\n"
-                    f"Целевой курс: {fmt(TARGET_RATE)} ₽\n"
-                    f"Тип курса: {RATE_TYPE.upper()}\nВремя: {updated_at}"
+                    "🟢 Мониторинг курса запущен\n\n"
+                    f"Покупка: {rates['bid']:.4f} ₽\n"
+                    f"Продажа: {rates['offer']:.4f} ₽\n"
+                    f"Отслеживаемый курс ({RATE_TYPE}): {rate:.4f} ₽\n"
+                    "Тариф: до 500 000 ₽"
                 )
-                state["target_triggered"] = True
-            elif not reached and state.get("target_triggered", False):
-                state["target_triggered"] = False
 
-        now = datetime.now().astimezone()
-        hour_key = now.strftime("%Y-%m-%d %H")
-        if state.get("last_hour") != hour_key:
-            await send_to_chat(app, "🕐 Часовая сводка — юань ВТБ\n\n" + rates_message())
-            state["last_hour"] = hour_key
-        save_state()
-        return web.json_response({"ok": True, "changed": changed})
-    except Exception as exc:
-        log.exception("Ошибка обработки курса/отправки Telegram")
-        save_state()
-        return web.json_response({"ok": False, "error": "telegram_send_failed"}, status=502)
+            else:
+                previous_rate = Decimal(str(previous))
 
-async def health(_request):
-    return web.json_response({"ok": True, "has_rate": state.get("bid") is not None})
+                bid_changed = (
+                    previous_bid is not None
+                    and rates["bid"] != Decimal(str(previous_bid))
+                )
+                offer_changed = (
+                    previous_offer is not None
+                    and rates["offer"] != Decimal(str(previous_offer))
+                )
 
-async def telegram_webhook(request: web.Request):
-    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
-    supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if secret and not hmac.compare_digest(supplied, secret):
-        return web.Response(status=403, text="Forbidden")
-    update_data = await request.json()
-    update = Update.de_json(update_data, request.app["telegram_app"].bot)
-    await request.app["telegram_app"].process_update(update)
-    return web.Response(text="OK")
+                if rate != previous_rate or bid_changed or offer_changed:
+                    if rate > previous_rate:
+                        arrow = "📈"
+                    elif rate < previous_rate:
+                        arrow = "📉"
+                    else:
+                        arrow = "🔄"
 
-async def start_web_server(app):
-    web_app = web.Application(client_max_size=64 * 1024)
-    web_app["telegram_app"] = app
-    web_app.router.add_get("/health", health)
-    web_app.router.add_post("/api/rates", receive_rates)
-    web_app.router.add_post(WEBHOOK_PATH, telegram_webhook)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    app.bot_data["web_runner"] = runner
-    log.info("HTTP endpoints started on port %s", PORT)
+                    delta = rate - previous_rate
+
+                    # Сохраняем данные последнего изменения для /status
+                    state["previous_rate"] = str(previous_rate)
+                    state["last_delta"] = str(delta)
+                    state["last_arrow"] = arrow
+                    state["last_updated"] = timestamp
+
+                    await send_message(
+                        app,
+                        f"{arrow} Изменение курса юаня\n\n"
+                        f"Покупка: {rates['bid']:.4f} ₽\n"
+                        f"Продажа: {rates['offer']:.4f} ₽\n"
+                        f"Отслеживаемый курс ({RATE_TYPE}): {rate:.4f} ₽\n"
+                        f"Предыдущий: {previous_rate:.4f} ₽\n"
+                        f"Изменение: {delta:+.4f} ₽\n"
+                        f"Время: {timestamp}"
+                    )
+
+                state["rate"] = str(rate)
+                state["bid"] = str(rates["bid"])
+                state["offer"] = str(rates["offer"])
+                state["last_updated"] = timestamp
+                save_state()
+
+            # Уведомление о достижении целевого курса
+            if TARGET_RATE > 0:
+                if TARGET_DIRECTION == "above":
+                    reached = rate >= TARGET_RATE
+                else:
+                    reached = rate <= TARGET_RATE
+
+                if reached and not state.get("target_triggered", False):
+                    await send_message(
+                        app,
+                        "🚨 ДОСТИГНУТ ЦЕЛЕВОЙ КУРС!\n\n"
+                        f"Текущий курс: {rate:.4f} ₽\n"
+                        f"Целевой курс: {TARGET_RATE:.4f} ₽\n"
+                        f"Тип курса: {RATE_TYPE.upper()}\n"
+                        f"Время: {timestamp}"
+                    )
+                    state["target_triggered"] = True
+                    save_state()
+
+                elif not reached and state.get("target_triggered", False):
+                    state["target_triggered"] = False
+                    save_state()
+
+            # Часовая сводка
+            hour_key = now.strftime("%Y-%m-%d %H")
+
+            if state.get("last_hour") != hour_key:
+                await send_message(
+                    app,
+                    "🕐 Часовая сводка — курс юаня\n\n"
+                    f"Покупка: {rates['bid']:.4f} ₽\n"
+                    f"Продажа: {rates['offer']:.4f} ₽\n"
+                    f"Отслеживаемый курс ({RATE_TYPE}): {rate:.4f} ₽\n"
+                    f"Тариф: до {MAX_AMOUNT:.0f} ₽\n"
+                    f"Время: {timestamp}"
+                )
+
+                state["last_hour"] = hour_key
+                save_state()
+
+        except Exception:
+            log.exception("Ошибка получения курса или отправки сообщения")
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
 
 async def post_init(app):
-    load_state()
-    await start_web_server(app)
-    public_url = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
-    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
-    if public_url:
-        if not webhook_secret:
-            raise RuntimeError("Если задан PUBLIC_URL, обязательно задайте TELEGRAM_WEBHOOK_SECRET")
-        webhook_url = f"{public_url}{WEBHOOK_PATH}"
-        await app.bot.set_webhook(
-            url=webhook_url,
-            secret_token=webhook_secret,
-            allowed_updates=["message"],
-        )
-        log.info("Telegram webhook установлен: %s", webhook_url)
-    else:
-        log.warning("PUBLIC_URL не задан: HTTP endpoint работает, но Telegram webhook автоматически не установлен.")
+    app.create_task(monitor(app))
 
-async def post_shutdown(app):
-    runner = app.bot_data.get("web_runner")
-    if runner:
-        await runner.cleanup()
+
+# =========================================================
+# ЗАПУСК
+# =========================================================
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задан BOT_TOKEN")
+
+    if not CHAT_ID:
+        raise RuntimeError("Не задан CHAT_ID")
+
+    if not RATES_API_URL:
+        raise RuntimeError("Не задан RATES_API_URL")
+
     if RATE_TYPE not in ("bid", "offer"):
         raise RuntimeError("RATE_TYPE должен быть bid или offer")
+
     if TARGET_DIRECTION not in ("below", "above"):
         raise RuntimeError("TARGET_DIRECTION должен быть below или above")
 
-    req = HTTPXRequest(
+    telegram_request = HTTPXRequest(
         connection_pool_size=8,
         connect_timeout=30,
         read_timeout=30,
         write_timeout=30,
         pool_timeout=30,
     )
-    app = (
+
+    updates_request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=40,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .request(req)
+        .request(telegram_request)
+        .get_updates_request(updates_request)
         .post_init(post_init)
-        .post_shutdown(post_shutdown)
         .build()
     )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("target", target_command))
-    log.info("Запуск Python-бота на BotHost")
-    # run_webhook здесь не используется: единый aiohttp-сервер обрабатывает
-    # и Telegram webhook, и POST с российского сервера.
-    app.run_polling() if not os.getenv("PUBLIC_URL") else run_webhook_mode(app)
 
-def run_webhook_mode(app):
-    # Telegram updates принимаются нашим aiohttp endpoint; запускаем Application
-    # без polling, сохраняя его event loop для aiohttp.
-    import asyncio as _asyncio
-    async def runner():
-        await app.initialize()
-        await app.start()
-        await post_init(app)
-        try:
-            await _asyncio.Event().wait()
-        finally:
-            await post_shutdown(app)
-            await app.stop()
-            await app.shutdown()
-    _asyncio.run(runner())
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("target", target_command))
+
+    log.info("Запуск Telegram-бота")
+    application.run_polling()
+
 
 if __name__ == "__main__":
     main()
