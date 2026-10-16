@@ -1,13 +1,11 @@
 import os
 import json
 import logging
-import asyncio
 import hmac
 from pathlib import Path
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-import requests
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -162,14 +160,22 @@ async def receive_rates(request: web.Request):
                 arrow = "📈"
             elif previous_tracked is not None and current_tracked < previous_tracked:
                 arrow = "📉"
-            delta = "—" if previous_tracked is None else f"{current_tracked - previous_tracked:+.4f}"
-            await send_to_chat(
-                app,
-                f"{arrow} Изменение курса юаня ВТБ\n\n"
-                f"Покупка: {fmt(bid)} ₽\nПродажа: {fmt(offer)} ₽\n"
-                f"Отслеживаемый курс ({RATE_TYPE}): {fmt(current_tracked)} ₽\n"
-                f"Предыдущий: {fmt(previous_tracked)} ₽\nИзменение: {delta} ₽\nВремя: {updated_at}"
+            delta = (
+                "—"
+                if previous_tracked is None
+                else f"{current_tracked - previous_tracked:+.4f}"
             )
+
+            message = (
+                f"{arrow} Изменение курса юаня ВТБ\n\n"
+                f"Покупка: {fmt(bid)} ₽\n"
+                f"Продажа: {fmt(offer)} ₽\n"
+                f"Отслеживаемый курс ({RATE_TYPE}): {fmt(current_tracked)} ₽\n"
+                f"Предыдущий: {fmt(previous_tracked)} ₽\n"
+                f"Изменение: {delta} ₽\n"
+                f"Время: {updated_at}"
+            )
+            await send_to_chat(app, message)
 
         if TARGET_RATE > 0:
             reached = current_tracked >= TARGET_RATE if TARGET_DIRECTION == "above" else current_tracked <= TARGET_RATE
